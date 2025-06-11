@@ -895,11 +895,17 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		error(`Error when attempting to initialize server: {response.user_message}`)
 	end
 	
+	local zyntexEventsFolder = Instance.new("Folder")
+	zyntexEventsFolder.Name = "zyntex.events"
+	local SystemChatEvent = Instance.new("RemoteEvent")
+	SystemChatEvent.Name = "SystemChat"
+	SystemChatEvent.Parent = zyntexEventsFolder
 	
+	zyntexEventsFolder.Parent = script.Parent
 	
 	-- Clone necessary client-side remote events into ReplicatedStorage if they don't exist.
 	if not game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events") then
-		script.Parent:FindFirstChild("zyntex.events"):Clone().Parent = game:GetService("ReplicatedStorage")
+		zyntexEventsFolder:Clone().Parent = game:GetService("ReplicatedStorage")
 	end
 
 	--// Capture and send historical logs from before the client initialized.
