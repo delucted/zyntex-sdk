@@ -80,7 +80,7 @@ local function muteUserId(mutedUserId)
 		end
 	end
 	
-	game:GetService("ReplicatedStorage"):WaitForChild("zyntex.events"):WaitForChild("SystemChat"):FireClient(Players:GetPlayerByUserId(mutedUserId), `You're muted.`)
+	game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events"):FindFirstChild("SystemChat"):FireClient(Players:GetPlayerByUserId(mutedUserId), `You're muted.`)
 end
 
 --[[
@@ -439,6 +439,11 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 
 	if self._config.debug then
 		print("[Zyntex]: Player join submitted.")
+	end
+
+	-- Clone necessary client-side remote events into ReplicatedStorage if they don't exist.
+	if not game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events") then
+		script.Parent:FindFirstChild("zyntex.events"):Clone().Parent = game:GetService("ReplicatedStorage")
 	end
 
 	-- Provide the player with the client-side script handler.
@@ -894,19 +899,6 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	if response.success == false then
 		error(`Error when attempting to initialize server: {response.user_message}`)
 	end
-	
-	local zyntexEventsFolder = Instance.new("Folder")
-	zyntexEventsFolder.Name = "zyntex.events"
-	local SystemChatEvent = Instance.new("RemoteEvent")
-	SystemChatEvent.Name = "SystemChat"
-	SystemChatEvent.Parent = zyntexEventsFolder
-	
-	zyntexEventsFolder.Parent = script.Parent
-	
-	-- Clone necessary client-side remote events into ReplicatedStorage if they don't exist.
-	if not game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events") then
-		zyntexEventsFolder:Clone().Parent = game:GetService("ReplicatedStorage")
-	end
 
 	--// Capture and send historical logs from before the client initialized.
 	-- Don't want to send 300 messages all at once :)
@@ -1024,7 +1016,8 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		-- Execute the code in a protected call to prevent crashes.
 		task.spawn(function()
 			local success,data = pcall(function()
-				require(script.Parent:FindFirstChild("luau"))(code)()
+				local executable,msg = require(4689019964)(code)
+				executable()
 			end)
 
 			if not success then
@@ -1138,5 +1131,11 @@ function Zyntex.link(self: Zyntex)
 
 	print(`[Zyntex]: Linking success!`)
 end
+
+
+
+--[[
+	The Zyntex module is returned to be required and used by other server scripts.
+]]
 
 return Zyntex
