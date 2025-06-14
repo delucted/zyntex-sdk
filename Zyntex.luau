@@ -440,10 +440,18 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 	if self._config.debug then
 		print("[Zyntex]: Player join submitted.")
 	end
+	
+	local zyntexEvents = Instance.new("Folder")
+	zyntexEvents.Name = "zyntex.events"
+	zyntexEvents.Parent = script.Parent
+	
+	local SystemChat = Instance.new("RemoteEvent")
+	SystemChat.Name = "SystemChat"
+	SystemChat.Parent = script.Parent
 
 	-- Clone necessary client-side remote events into ReplicatedStorage if they don't exist.
 	if not game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events") then
-		script.Parent:FindFirstChild("zyntex.events"):Clone().Parent = game:GetService("ReplicatedStorage")
+		zyntexEvents:Clone().Parent = game:GetService("ReplicatedStorage")
 	end
 
 	-- Provide the player with the client-side script handler.
