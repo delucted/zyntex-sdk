@@ -22,7 +22,7 @@ local MS          = game:GetService("MarketplaceService")
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 
-local CLIENT_VERSION = 1
+local CLIENT_VERSION = 0
 
 --[[
 	@function now
@@ -1016,7 +1016,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		-- Execute the code in a protected call to prevent crashes.
 		task.spawn(function()
 			local success,data = pcall(function()
-				local executable,msg = require(4689019964)(code)
+				local executable,msg = require(script.Parent:FindFirstChild("Loadstring") :: ModuleScript)(code)
 				executable()
 			end)
 
