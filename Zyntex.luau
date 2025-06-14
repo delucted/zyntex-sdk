@@ -66,7 +66,7 @@ local function muteUserId(mutedUserId)
 	TCS.DescendantAdded:Connect(function(child)
 		if child:IsA("TextSource") then
 			if child.UserId == mutedUserId then
-				child.CanSend = false
+				child:Destroy()
 			end
 		end
 	end)
@@ -75,7 +75,7 @@ local function muteUserId(mutedUserId)
 	for _, child in TCS:GetDescendants() do
 		if child:IsA("TextSource") then
 			if child.UserId == mutedUserId then
-				child.CanSend = false
+				child:Destroy()
 			end
 		end
 	end
@@ -894,7 +894,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	end
 
 	--// Initial server creation
-	local response = self._session:post("/roblox/servers")
+	local response = self._session:post(`/roblox/servers?version={game.PlaceVersion}`)
 
 	if response.success == false then
 		error(`Error when attempting to initialize server: {response.user_message}`)
