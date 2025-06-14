@@ -84,6 +84,47 @@ local function muteUserId(mutedUserId)
 end
 
 --[[
+  _____  _                       
+ |  __ \| |                      
+ | |__) | | __ _ _   _  ___ _ __ 
+ |  ___/| |/ _` | | | |/ _ \ '__|
+ | |    | | (_| | |_| |  __/ |   
+ |_|    |_|\__,_|\__, |\___|_|   
+                  __/ |          
+                 |___/           
+                 
+	This section defines the 'ZyntexPlayer' object, which represents a Player
+	in the Zyntex dashboard.
+]]
+
+local ZyntexPlayer = {}
+ZyntexPlayer.__index = ZyntexPlayer
+
+-- Represents a single, recorded instance of an invoked event.
+type ZyntexPlayerType = {
+	id: number; -- The unique ID of this specific player. Equivalent to the Roblox UserId
+	name: string; -- The player's username as it appears on Roblox.
+	avatar_url: string; -- The player's headshot avatar url.
+	avatar_url_cache_expiry: string; -- When the player's avatar URL expires. Not important for Roblox.
+	reputation: string; -- The player's reputation enum. Can be: 'clean', 'suspect', or 'offender'. https://docs.zyntex.dev/moderation/reputation
+	raw_reputation: number; -- The player's raw reputation as an integer. https://docs.zyntex.dev/moderation/reputation
+}
+
+export type ZyntexPlayer = typeof(setmetatable({} :: ZyntexPlayerType, ZyntexPlayer))
+
+function ZyntexPlayer.new(id: number, name: string, avatar_url: string, avatar_url_cache_expiry: string, reputation: string, raw_reputation: number)
+	local self = {}
+	self.id = id;
+	self.name = name
+	self.avatar_url = avatar_url
+	self.avatar_url_cache_expiry = avatar_url_cache_expiry
+	self.reputation = reputation
+	self.raw_reputation = raw_reputation
+
+	return setmetatable(self, ZyntexPlayer)
+end
+
+--[[
 
   _____                                _   _               
  |_   _|                              | | (_)              
@@ -423,18 +464,33 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 	)
 
 	if not res.success then
+		local _warn = true		
 		-- Handle if the player is banned.
 		if res.statusCode == 403 then
-			player:Kick(res.user_message)
-			warn(`[Zyntex]: {player.Name} attempted to join but they are banned.`)
+			if #self._listeners["ban"] == 0 then
+				player:Kick(res.user_message)
+				warn(`[Zyntex]: {player.Name} attempted to join but they are banned.`)
+			else
+				for _,listener in self._listeners["ban"] do
+					listener(player.UserId, res.user_message)
+				end
+			end
 			return
 		end
-		if res.statusCode == 401 then
-			muteUserId(player.UserId)
-			warn(`[Zyntex]: {player.Name} joined and are automatically muted.`)
-			return
+		if res.statusCode == 403 then
+			if #self._listeners["ban"] == 0 then
+				muteUserId(player.UserId)
+				warn(`[Zyntex]: {player.Name} attempted to join and are automatically muted.`)
+			else
+				for _,listener in self._listeners["ban"] do
+					listener(player.UserId, res.user_message)
+				end
+			end
+			_warn = false
 		end
-		warn(`[Zyntex]: Could not submit POST /roblox/players: "{res.user_message}"`)
+		if _warn then
+			warn(`[Zyntex]: Could not submit POST /roblox/players: "{res.user_message}"`)
+		end
 	end
 
 	if self._config.debug then
@@ -447,7 +503,7 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 	
 	local SystemChat = Instance.new("RemoteEvent")
 	SystemChat.Name = "SystemChat"
-	SystemChat.Parent = script.Parent
+	SystemChat.Parent = zyntexEvents
 
 	-- Clone necessary client-side remote events into ReplicatedStorage if they don't exist.
 	if not game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events") then
@@ -823,7 +879,7 @@ end
 function Zyntex.new(gameToken: string): Zyntex
 	local self = {}
 
-	self._session   = API.new(gameToken)
+	self._session   = API.new(gameToken, "http://localhost:8000")
 	self._config    = {}
 	self._events    = {}
 	self._listeners = {}
@@ -881,6 +937,77 @@ local function simulateActivity(self)
 	end
 end
 
+--[[
+	@method Zyntex:GetPlayerInfo
+	@description Fetches and returns player information, such as reputation, total robux spent, and total time played.
+	
+	@param self Zyntex
+	@param player Player|number -- Either a Player object or the player's UserId. If UserId, the player does not have to be in the server.
+]]
+function Zyntex.GetPlayerInfo(self: Zyntex, player: Player | number): {player: ZyntexPlayer, total_robux_spent: number, total_time_played: number}
+	local res = self._session:get(`/roblox/players/{if type(player) == "number" then player else player.UserId}`)
+
+	assert(res.success, `Failed when attempting to fetch player: {res.user_message}`)
+
+	local playerInfo = res.data
+	local playerInfoRaw = res.data.player
+	
+	playerInfo["player"] = ZyntexPlayer.new(
+		playerInfoRaw.id,
+		playerInfoRaw.name,
+		playerInfoRaw.avatar_url,
+		playerInfoRaw.avatar_url_cache_expiry,
+		playerInfoRaw.reputation,
+		playerInfoRaw.raw_reputation
+	)
+	
+	return playerInfo
+end
+
+--[[
+	@method Zyntex:OnModeration
+	@description Creates a hook to the moderation action.
+	
+	@param self Zyntex
+	@param moderationType string -- Returns a moderationType. Either 'ban', 'mute', or 'kick'.
+	@param callback (playerId: number, reason: string) -> nil -- The callback that is called whenever the moderation occurs.
+]]
+function Zyntex.OnModeration(self: Zyntex, moderationType: string, callback: (player: number, reason: string) -> nil)
+	table.insert(self._listeners[moderationType], callback)
+end
+
+--[[
+	@method Zyntex:OnModeration
+	@description Creates a hook to the 'kick' moderation action.
+	
+	@param self Zyntex
+	@param callback (playerId: number, reason: string) -> nil -- The callback that is called whenever the kick occurs.
+]]
+function Zyntex.OnKick(self: Zyntex, callback: (player: number, reason: string) -> nil)
+	return self:OnModeration("kick", callback)
+end
+
+--[[
+	@method Zyntex:OnModeration
+	@description Creates a hook to the 'ban' moderation action.
+	
+	@param self Zyntex
+	@param callback (playerId: number, reason: string) -> nil -- The callback that is called whenever the ban occurs.
+]]
+function Zyntex.OnBan(self: Zyntex, callback: (player: number, reason: string) -> nil)
+	return self:OnModeration("ban", callback)
+end
+
+--[[
+	@method Zyntex:OnMute
+	@description Creates a hook to the 'mute' moderation action.
+	
+	@param self Zyntex
+	@param callback (playerId: number, reason: string) -> nil -- The callback that is called whenever the mute occurs.
+]]
+function Zyntex.OnMute(self: Zyntex, callback: (player: number, reason: string) -> nil)
+	return self:OnModeration("mute", callback)
+end
 
 --[[
 	@method Zyntex:init
@@ -946,20 +1073,6 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	--// Start the background processes.
 	task.spawn(statusUpdateLoop, self)
 	task.spawn(self:poll(since))
-
-	--// Connect player join/leave listeners.
-	Players.PlayerAdded:Connect(function(player: Player)
-		return onPlayerAdd(self, player)
-	end)
-
-	--// Ensure any players already present at initialization are registered.
-	for i,player in Players:GetPlayers() do
-		onPlayerAdd(self, player)
-	end
-
-	Players.PlayerRemoving:Connect(function(player: Player)
-		return onPlayerRemove(self, player)
-	end)
 
 	if config.debug then
 		print("[Zyntex]: Fetching events...")
@@ -1071,9 +1184,13 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	
 	--// Handle moderation action from the dashboard.
 	self._listeners["moderation"] = {}
+	self._listeners["ban"]  = {}
+	self._listeners["mute"] = {}
+	self._listeners["kick"] = {}
 	table.insert(self._listeners["moderation"], function(action)
 		if config.debug then
 			print(`[Zyntex]: Fulfilling moderation request...`)
+			print(`[Zyntex]: {action}`)
 		end
 		
 		local fullfilled = false
@@ -1082,18 +1199,25 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		local player_id = action.metadata.player_id
 		local reason = action.metadata.reason
 		
-		if type == "ban" or type == "kick" then
-			local player = Players:GetPlayerByUserId(player_id)
-			if player then
-				player:Kick(reason)
-				fullfilled = true
+		if #self._listeners[type] == 0 then
+			if type == "ban" or type == "kick" then
+				local player = Players:GetPlayerByUserId(player_id)
+				if player then
+					player:Kick(reason)
+					fullfilled = true
+				end
 			end
-		end
-		
-		if type == "mute" then
-			local player = Players:GetPlayerByUserId(player_id)
-			if player then
-				muteUserId(player.UserId)
+			
+			if type == "mute" then
+				local player = Players:GetPlayerByUserId(player_id)
+				if player then
+					muteUserId(player.UserId)
+					fullfilled = true
+				end
+			end
+		else
+			for _,listener in self._listeners[type] do
+				listener(player_id, reason)
 				fullfilled = true
 			end
 		end
@@ -1119,6 +1243,20 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			simulateActivity(self)
 		end)
 	end
+	
+	--// Connect player join/leave listeners.
+	Players.PlayerAdded:Connect(function(player: Player)
+		return onPlayerAdd(self, player)
+	end)
+
+	--// Ensure any players already present at initialization are registered.
+	for i,player in Players:GetPlayers() do
+		onPlayerAdd(self, player)
+	end
+	
+	Players.PlayerRemoving:Connect(function(player: Player)
+		return onPlayerRemove(self, player)
+	end)
 end
 
 --[[
