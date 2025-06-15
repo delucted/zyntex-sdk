@@ -879,7 +879,7 @@ end
 function Zyntex.new(gameToken: string): Zyntex
 	local self = {}
 
-	self._session   = API.new(gameToken, "http://localhost:8000")
+	self._session   = API.new(gameToken)
 	self._config    = {}
 	self._events    = {}
 	self._listeners = {}
