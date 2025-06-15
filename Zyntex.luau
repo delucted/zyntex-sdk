@@ -22,7 +22,7 @@ local MS          = game:GetService("MarketplaceService")
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 
-local CLIENT_VERSION = 1
+local CLIENT_VERSION = 0
 
 --[[
 	@function now
@@ -336,7 +336,7 @@ function Event.new(zyntex: Zyntex, id: number, name: string, description: string
 
 	return setmetatable(self, Event)
 end
-
+Instance.new("BindableEvent"):Fire()
 --[[
 
   ______           _            
@@ -879,7 +879,7 @@ end
 function Zyntex.new(gameToken: string): Zyntex
 	local self = {}
 
-	self._session   = API.new(gameToken)
+	self._session   = API.new(gameToken, "http://localhost:8000")
 	self._config    = {}
 	self._events    = {}
 	self._listeners = {}
@@ -1187,6 +1187,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	self._listeners["ban"]  = {}
 	self._listeners["mute"] = {}
 	self._listeners["kick"] = {}
+	self._listeners["report"] = {}
 	table.insert(self._listeners["moderation"], function(action)
 		if config.debug then
 			print(`[Zyntex]: Fulfilling moderation request...`)
@@ -1198,6 +1199,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		local type = action.metadata.type
 		local player_id = action.metadata.player_id
 		local reason = action.metadata.reason
+		
 		
 		if #self._listeners[type] == 0 then
 			if type == "ban" or type == "kick" then
@@ -1218,8 +1220,8 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		else
 			for _,listener in self._listeners[type] do
 				listener(player_id, reason)
-				fullfilled = true
 			end
+			fullfilled = true
 		end
 		
 		if fullfilled then
