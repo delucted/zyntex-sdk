@@ -22,7 +22,7 @@ local MS          = game:GetService("MarketplaceService")
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 
-local CLIENT_VERSION = 0
+local CLIENT_VERSION = 1
 
 --[[
 	@function now
