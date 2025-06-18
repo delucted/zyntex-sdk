@@ -415,7 +415,6 @@ function Zyntex.statusUpdate(self: Zyntex, status: {string: number})
 		)
 
 		if not res.success then
-			print(res)
 			warn(`Failed to submit server status update: {res.user_message}`)
 		end
 
