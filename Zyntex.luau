@@ -1,7 +1,7 @@
 --[[
 	Zyntex Roblox SDK
-	Version: 2
-	Last Updated: 2025-06-17
+	Version: 3
+	Last Updated: 2025-06-21
 	Author: Deluct
 	
 	This module is the main client for the Zyntex Advanced Admin/Ops Panel.
@@ -22,7 +22,7 @@ local MS          = game:GetService("MarketplaceService")
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 
-local CLIENT_VERSION = 2
+local CLIENT_VERSION = 3
 
 --[[
 	@function now
@@ -950,7 +950,7 @@ local function simulateActivity(self)
 		if action == 1 or action == 2 then
 			-- Simulate Player Join
 			local name = randomUsername()
-			local id = math.random(100000, 999999)
+			local id = 16054156146
 			local fakePlayer = {
 				Name = name,
 				UserId = id
@@ -1061,7 +1061,12 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	end
 
 	--// Initial server creation
-	local response = self._session:post(`/roblox/servers?version={game.PlaceVersion}`)
+	local privateServerId = game.PrivateServerId
+	local privateServerParameter = ""
+	if privateServerId ~= "" and game.PrivateServerOwnerId ~= 0 then
+		privateServerParameter = `&isPrivate={privateServerId}`
+	end
+	local response = self._session:post(`/roblox/servers?version={game.PlaceVersion}{privateServerParameter}`)
 
 	if response.success == false then
 		error(`Error when attempting to initialize server: {response.user_message}`)
