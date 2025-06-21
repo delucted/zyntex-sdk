@@ -550,7 +550,6 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 	end
 	
 	table.insert(SERVER_ACTIVITY, activity)
-	print(SERVER_ACTIVITY)
 end
 
 --[[
