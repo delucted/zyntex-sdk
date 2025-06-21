@@ -91,9 +91,6 @@ end
 ]]
 function Session.request(self: Session, endpoint: string, method: string, body: {[string]: any}?, autoError: boolean?): Response
 	local success, data: Response = pcall(function()
-		if endpoint == "/roblox/events/" then
-			print(if body then HttpService:JSONEncode(body) else nil)
-		end
 		local res = HttpService:RequestAsync(
 			{
 				["Url"]     = `{self.rootUrl}{endpoint}`;
