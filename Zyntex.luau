@@ -1,7 +1,7 @@
 --[[
 	Zyntex Roblox SDK
-	Version: 3
-	Last Updated: 2025-06-21
+	Version: 4
+	Last Updated: 2025-07-26
 	Author: Deluct
 	
 	This module is the main client for the Zyntex Advanced Admin/Ops Panel.
@@ -21,8 +21,9 @@ local MS          = game:GetService("MarketplaceService")
 
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
+local Telemetry   = require(script.Parent:FindFirstChild("Telemetry"))
 
-local CLIENT_VERSION = 3
+local CLIENT_VERSION = 4
 
 --[[
 	@function now
@@ -341,6 +342,130 @@ function Event.new(zyntex: Zyntex, id: number, name: string, description: string
 end
 
 --[[
+  ______                _   _                 
+ |  ____|              | | (_)                
+ | |__ _   _ _ __   ___| |_ _  ___  _ __  ___ 
+ |  __| | | | '_ \ / __| __| |/ _ \| '_ \/ __|
+ | |  | |_| | | | | (__| |_| | (_) | | | \__ \
+ |_|   \__,_|_| |_|\___|\__|_|\___/|_| |_|___/
+                                              
+	This section defines the 'Function' object, which is similar to events, but
+	can only be invoked from the web-dashboard and it sends back data
+]]
+
+local Function = {}
+Function.__index = Function
+
+type FunctionParameter = {
+	name: string; -- The name of the paramater
+	type: string; -- The type of the parameter's value
+}
+
+-- Represents a remote function defined in the Zyntex dashboard.
+type FunctionType = {
+	id: number; -- The unique ID of the function.
+	name: string; -- The user-defined name of the event.
+	description: string; -- The user-defined description of the event.
+	parameters: {FunctionParameter}; -- The list of parameters the function accepts
+	_zyntex: Zyntex;
+	
+	Connect: (self: Function, listener: ({[string]: any}) -> any) -> nil;
+	
+}
+
+export type Function = typeof(setmetatable({} :: FunctionType, Function))
+
+--[[
+	@constructor Function.new
+	@description Constructs a new Function object that represents a callable remote function
+	defined in the Zyntex dashboard. This is typically used internally when the client
+	initializes and materializes the functions available to your experience.
+
+	@param zyntex Zyntex -- The active Zyntex client, used for networking and configuration.
+	@param id number -- The unique ID of the remote function.
+	@param name string -- The user-defined name of the function.
+	@param description string -- A human-readable description of the function.
+	@param parameters {FunctionParameter} -- The schema describing the parameters this function accepts.
+
+	@return Function -- The constructed Function instance.
+]]
+function Function.new(zyntex: Zyntex, id: number, name: string, description: string, parameters: {FunctionParameter})
+	local self = {}
+	self.id = id
+	self.name = name
+	self.description = description
+	self.parameters = parameters
+	self._zyntex = zyntex
+
+	return setmetatable(self, Function)
+end
+
+--[[
+	@method Function:Connect
+	@description Registers a listener that will be invoked whenever a call targeting this
+	remote function is received from the Zyntex backend. The listener is passed a simple
+	parameters table and is expected to return a value (typically a table) which will be
+	sent back to Zyntex as the payload response.
+
+	@param self Function -- The Function instance to listen on.
+	@param listener (({[string]: any}) -> any) -- Callback executed when this function is invoked.
+		- Receives: a table of parameter key/value pairs (`metadata.parameters`).
+		- Returns: any serializable value (commonly a table) that becomes the payload response.
+
+	@return nil -- This method registers the listener and does not return a connection handle.
+
+	@errors Asserts if the payload POST fails; the assertion message is the API's `user_message`.
+
+	@example
+	-- Assume a remote function "Add" with parameters: { a: number, b: number }
+	local addFn = Zyntex:GetFunction("Add")
+	addFn:Connect(function(params)
+		local a = params.a
+		local b = params.b
+		-- Whatever is returned here is sent back to Zyntex as the payload:
+		return { sum = a + b }
+	end)
+]]
+function Function.Connect(self: Function, listener: ({[string]: any}) -> any)
+	local function wrapper(data)
+		if data.metadata.function_id == self.id then
+			if self._zyntex._config.debug then
+				print(`[Zyntex]: Function received, calling listener...`)
+			end
+
+			local payload = listener(
+				data.metadata.parameters
+			)
+
+			if self._zyntex._config.debug then
+				print(`[Zyntex]: Sending payload response...`)
+			end
+			
+			assert(payload ~= nil, 'Function:Connect hook must return a value')
+
+			local callRes = self._zyntex._session:post(
+				`/roblox/actions/{data.id}/send_payload`,
+				{ ["data"] = payload }
+			)
+			
+			assert(callRes.success, callRes.user_message)
+
+			if self._zyntex._config.debug then
+				print(`[Zyntex]: Successfully sent payload response to function`)
+			end
+		end
+	end
+	if not self._zyntex._listeners["function"] then
+		self._zyntex._listeners["function"] = {}
+	end
+	table.insert(
+		self._zyntex._listeners["function"], 
+		wrapper
+	)
+end
+
+
+--[[
 
   ______           _            
  |___  /          | |           
@@ -363,6 +488,7 @@ type ZyntexType = {
 	_session: API.Session; -- Handles authenticated requests to the Zyntex API.
 	_config:  TYPES.Config; -- Stores the user-defined configuration for the client.
 	_events:  {Event}; -- A list of all available Event objects fetched from the backend.
+	_functions: {Function}; -- A list of all available Function objects fetched from the backend.
 	_listeners: {[string]: ({[string]: any}) -> nil}; -- A dictionary of listeners for incoming actions (e.g., 'shutdown', 'rce').
 	_version: number
 }
@@ -596,16 +722,15 @@ end
 	@description Fetches a pre-loaded Event object using its unique numerical ID.
 	@param self Zyntex
 	@param eventId number -- The ID of the event to retrieve.
-	@return Event -- The corresponding Event object.
+	@return Event? -- The corresponding Event object, if exists.
 ]]
-function Zyntex.GetEventByID(self: Zyntex, eventId: number): Event
+function Zyntex.GetEventByID(self: Zyntex, eventId: number): Event?
 	for i,event in pairs(self._events) do
 		if event.id == eventId then
 			return event
 		end
 	end
-
-	error(`Event {eventId} not found in events list`)
+	return nil
 end
 
 --[[
@@ -613,18 +738,48 @@ end
 	@description Fetches a pre-loaded Event object using its unique string name. This is the most common way to get an event.
 	@param self Zyntex
 	@param eventName string -- The case-sensitive name of the event.
-	@return Event -- The corresponding Event object.
+	@return Event? -- The corresponding Event object, if it exists.
 ]]
-function Zyntex.GetEvent(self: Zyntex, eventName: string): Event
+function Zyntex.GetEvent(self: Zyntex, eventName: string): Event?
 	for i,event in pairs(self._events) do
 		if event.name == eventName then
 			return event
 		end
 	end
-
-	error(`Event "{eventName}" not found in events list`)
+	return nil
 end
 
+--[[
+	@method Zyntex:GetFunctionByID
+	@description Fetches a pre-loaded Function object using its unique numerical ID.
+	@param self Zyntex
+	@param functionId number -- The ID of the function to retrieve.
+	@return Function? -- The corresponding Function object, if it exists.
+]]
+function Zyntex.GetFunctionByID(self: Zyntex, functionId: number): Function?
+	for i,func in self._functions do
+		if func.id == functionId then
+			return func
+		end
+	end
+	return nil
+end
+
+--[[
+	@method Zyntex:GetFunction
+	@description Fetches a pre-loaded Function object using its unique string name. This is the most common way to get a function.
+	@param self Zyntex
+	@param functionName string -- The case-sensitive name of the function.
+	@return Function? -- The corresponding Function object, if it exists.
+]]
+function Zyntex.GetFunction(self: Zyntex, functionName: string): Function?
+	for i,func in self._functions do
+		if func.name == functionName then
+			return func
+		end
+	end
+	return nil
+end
 
 --[[
 	@method Zyntex:Moderate
@@ -909,9 +1064,10 @@ end
 function Zyntex.new(gameToken: string): Zyntex
 	local self = {}
 
-	self._session   = API.new(gameToken)
+	self._session   = API.new(gameToken, "http://localhost:8000")
 	self._config    = {}
 	self._events    = {}
+	self._functions = {}
 	self._listeners = {}
 	self._version   = CLIENT_VERSION
 
@@ -964,8 +1120,6 @@ local function simulateActivity(self)
 			local fakePlayer = table.remove(fakePlayers, index)
 			pcall(onPlayerRemove, self, fakePlayer)
 		end
-		
-		print(`PLAYER COUNT: {#fakePlayers + 1}`)
 	end
 end
 
@@ -1010,7 +1164,7 @@ end
 
 --[[
 	@method Zyntex:OnModeration
-	@description Creates a hook to the 'kick' moderation action.
+	@description Creates a hook to the 'kick' mo	eration action.
 	
 	@param self Zyntex
 	@param callback (playerId: number, reason: string) -> nil -- The callback that is called whenever the kick occurs.
@@ -1116,20 +1270,31 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		print("[Zyntex]: Fetching events...")
 	end
 
-	--// Fetch all available remote events from the backend.
-	local res = self._session:get("/roblox/events")
+	--// Fetch event + function manifest
+	local res = self._session:get("/roblox/manifest")
 
 	if not res.success then
-		warn(`[Zyntex]: Could not fetch events: {res.user_message}`)
+		warn(`[Zyntex]: Could not fetch manifest: {res.user_message}`)
 	end
 
-	for i,event in pairs(res.data) do
+	for i,v in pairs(res.data) do
+		if v.type == "function" then
+			table.insert(self._functions, Function.new(
+				self,
+				v.id,
+				v.name,
+				v.description,
+				v.parameters
+				)
+			)
+			continue
+		end
 		table.insert(self._events, Event.new(
 			self,
-			event.id,
-			event.name,
-			event.description,
-			event.data,
+			v.id,
+			v.name,
+			v.description,
+			v.data,
 			false
 			)
 		)
@@ -1318,7 +1483,24 @@ function Zyntex.link(self: Zyntex)
 	print(`[Zyntex]: Linking success!`)
 end
 
-
+--[[
+	@method Zyntex:Telemetry
+	@description Constructs a new Telemetry object used for prometheus-style metrics.
+	@param flushEvery number? -- How often to flush the buffer in seconds. Default is 10,
+	which is the minimum to not get ratelimited.
+	@param registryName string? -- The name of the registry. Default is "default"
+]]
+function Zyntex.Telemetry(self: Zyntex, flushEvery: number?, registryName: string?)
+	if not flushEvery then
+		flushEvery = 10
+	end
+	assert(flushEvery >= 10, `flushEvery must be no less than 10`)
+	return Telemetry.new(
+		registryName,
+		flushEvery,
+		self._session
+	)
+end
 
 --[[
 	The Zyntex module is returned to be required and used by other server scripts.
