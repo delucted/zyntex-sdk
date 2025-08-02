@@ -1,7 +1,7 @@
 --[[
 	Zyntex Roblox SDK
-	Version: 4
-	Last Updated: 2025-07-26
+	Version: 5
+	Last Updated: 2025-08-02
 	Author: Deluct
 	
 	This module is the main client for the Zyntex Advanced Admin/Ops Panel.
@@ -23,7 +23,7 @@ local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 local Telemetry   = require(script.Parent:FindFirstChild("Telemetry"))
 
-local CLIENT_VERSION = 4
+local CLIENT_VERSION = 5
 
 --[[
 	@function now
