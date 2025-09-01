@@ -1,7 +1,7 @@
 --[[
 	Zyntex Roblox SDK
-	Version: 5
-	Last Updated: 2025-08-02
+	Version: 6
+	Last Updated: 2025-09-01
 	Author: Deluct
 	
 	This module is the main client for the Zyntex Advanced Admin/Ops Panel.
@@ -22,8 +22,11 @@ local MS          = game:GetService("MarketplaceService")
 local API         = require(script.Parent:FindFirstChild("api"))
 local TYPES       = require(script.Parent:FindFirstChild("types"))
 local Telemetry   = require(script.Parent:FindFirstChild("Telemetry"))
+local Experiments = require(script.Parent:FindFirstChild("Experiments"))
 
-local CLIENT_VERSION = 5
+local CLIENT_VERSION = 6
+
+
 
 --[[
 	@function now
@@ -80,7 +83,7 @@ local function muteUserId(mutedUserId)
 			end
 		end
 	end
-	
+
 	game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events"):FindFirstChild("SystemChat"):FireClient(Players:GetPlayerByUserId(mutedUserId), `You're muted.`)
 end
 
@@ -247,29 +250,28 @@ export type Event = typeof(setmetatable({} :: EventType, Event))
 	})
 ]]
 function Event.Invoke(self: Event, data: Data): Invocation
-	local res = self._zyntex._session:post(
+	-- Enqueue; response comes back via /push listen_data later.
+	self._zyntex._session:post(
 		`/roblox/events/invoke`,
 		{
+			["server_id"] = self._zyntex._session.jobID,
 			["event_id"] = self.id;
 			["data"] = data
 		}
 	)
 
-	if not res.success then
-		error(`Could not invoke event {self.name}: {res.user_message}`)
-	end
-
+	-- Return a synthetic "queued" invocation placeholder
 	return Invocation.new(
-		res.data.id,
-		res.data.event_id,
-		res.data.data,
-		res.data.to,
-		res.data.sender,
-		res.data.from_server,
-		res.data.invoked_at,
-		res.data.to_server,
-		res.data.game_id,
-		res.data.invoked_by
+		-1,
+		self.id,
+		data,
+		"web",
+		"roblox",
+		self._zyntex._session.jobID,
+		now(),
+		nil,
+		0,
+		0
 	)
 end
 
@@ -368,9 +370,9 @@ type FunctionType = {
 	description: string; -- The user-defined description of the event.
 	parameters: {FunctionParameter}; -- The list of parameters the function accepts
 	_zyntex: Zyntex;
-	
+
 	Connect: (self: Function, listener: ({[string]: any}) -> any) -> nil;
-	
+
 }
 
 export type Function = typeof(setmetatable({} :: FunctionType, Function))
@@ -440,15 +442,14 @@ function Function.Connect(self: Function, listener: ({[string]: any}) -> any)
 			if self._zyntex._config.debug then
 				print(`[Zyntex]: Sending payload response...`)
 			end
-			
+
 			assert(payload ~= nil, 'Function:Connect hook must return a value')
 
 			local callRes = self._zyntex._session:post(
 				`/roblox/actions/{data.id}/send_payload`,
-				{ ["data"] = payload }
+				{ ["data"] = payload },
+				true
 			)
-			
-			assert(callRes.success, callRes.user_message)
 
 			if self._zyntex._config.debug then
 				print(`[Zyntex]: Successfully sent payload response to function`)
@@ -490,7 +491,8 @@ type ZyntexType = {
 	_events:  {Event}; -- A list of all available Event objects fetched from the backend.
 	_functions: {Function}; -- A list of all available Function objects fetched from the backend.
 	_listeners: {[string]: ({[string]: any}) -> nil}; -- A dictionary of listeners for incoming actions (e.g., 'shutdown', 'rce').
-	_version: number
+	_version: number;
+	_pendingJoins: {[string]: Player}; -- key: batch rid -> Player
 }
 
 export type Zyntex = typeof(setmetatable({} :: ZyntexType, Zyntex))
@@ -535,20 +537,23 @@ function Zyntex.statusUpdate(self: Zyntex, status: {string: number})
 	end
 
 	pcall(function()
-		local res = self._session:post(
-			"/roblox/servers/status", 
-			status
+		self._session:post(
+			"/roblox/servers/status",
+			table.freeze({
+				["server_id"] = self._session.jobID,
+				["memory_usage"] = status["memory_usage"],
+				["server_fps"] = status["server_fps"],
+				["data_send_kbps"] = status["data_send_kbps"],
+				["data_receive_kbps"] = status["data_receive_kbps"],
+				["activity"] = status["activity"],
+				["health"] = if status["health"] == "unhealthy" then "unhealthy" else "healthy"
+			})
 		)
-
-		if not res.success then
-			warn(`Failed to submit server status update: {res.user_message}`)
-		end
-
 		if self._config.debug then
-			print("[Zyntex]: Sent server status update")
+			print("[Zyntex]: Sent server status update (queued)")
 		end
 	end)
-	
+
 	sendingStatus = false
 end
 
@@ -581,64 +586,38 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 	if self._config.debug then
 		print(`[Zyntex]: Handling player join for {player.Name}`)
 	end
-	
+
 	local when = now()
 	local activity = {
 		player_id = player.UserId,
 		player_name = player.Name,
 		joined_at = when
 	}
-	
-	-- Register the player's session with the Zyntex backend.
-	local res = self._session:post(
-		"/roblox/players", 
+
+	-- Enqueue join; **capture the batch item's rid** returned by api.post
+	local rid = self._session:post(
+		"/roblox/players",
 		{
+			["server_id"] = self._session.jobID,
 			["id"] = player.UserId,
 			["name"] = player.Name,
 			["timestamp"] = when
-		},
-		false
+		}
 	)
-	
+	-- Track pending join by the **batch rid** so we can reconcile on push results
+	self._pendingJoins[rid] = player
+
 	pcall(function()
-		if not res.success then
-			local _warn = true		
-			-- Handle if the player is banned.
-			if res.statusCode == 403 then
-				if #self._listeners["ban"] == 0 then
-					player:Kick(res.user_message)
-					warn(`[Zyntex]: {player.Name} attempted to join but they are banned.`)
-				else
-					for _,listener in self._listeners["ban"] do
-						listener(player.UserId, res.user_message)
-					end
-				end
-				return
-			end
-			if res.statusCode == 403 then
-				if #self._listeners["ban"] == 0 then
-					muteUserId(player.UserId)
-					warn(`[Zyntex]: {player.Name} attempted to join and are automatically muted.`)
-				else
-					for _,listener in self._listeners["ban"] do
-						listener(player.UserId, res.user_message)
-					end
-				end
-				_warn = false
-			end
-			if _warn then
-				warn(`[Zyntex]: Could not submit POST /roblox/players: "{res.user_message}"`)
-			end
-		end
+		-- No immediate response under /push; moderation blocks are surfaced via server on next poll.
 
 		if self._config.debug then
 			print("[Zyntex]: Player join submitted.")
 		end
-		
+
 		local zyntexEvents = Instance.new("Folder")
 		zyntexEvents.Name = "zyntex.events"
 		zyntexEvents.Parent = script.Parent
-		
+
 		local SystemChat = Instance.new("RemoteEvent")
 		SystemChat.Name = "SystemChat"
 		SystemChat.Parent = zyntexEvents
@@ -657,6 +636,7 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 				self._session:post(
 					"/roblox/players/chat",
 					{
+						["server_id"] = self._session.jobID,
 						["message"] = msg;
 						["player_id"] = player.UserId
 					}
@@ -670,11 +650,9 @@ local function onPlayerAdd(self: Zyntex, player: Player)
 			maxPlayers = count
 		end
 	end)
-	
-	if tonumber(res.data) then
-		activity["visit_id"] = tonumber(res.data)
-	end
-	
+
+	-- visit_id will be reconciled on the backend; we don't have it synchronously here.
+
 	table.insert(SERVER_ACTIVITY, activity)
 end
 
@@ -689,30 +667,37 @@ local function onPlayerRemove(self: Zyntex, player: Player)
 	if self._config.debug then
 		print(`[Zyntex]: Handling player leave for {player.Name}`)
 	end
-	
+
 	local when = now()
 
-	local res = self._session:delete(
+	-- Clean up any pending joins for this player
+	for rid, pendingPlayer in pairs(self._pendingJoins) do
+		if pendingPlayer.UserId == player.UserId then
+			self._pendingJoins[rid] = nil
+			if self._config.debug then
+				print(("[Zyntex]: Cleaned up pending join for leaving player %s (RID: %s)"):format(player.Name, rid))
+			end
+			break
+		end
+	end
+
+	-- Enqueue leave (handled by /roblox/push). Fire-and-forget.
+	self._session:delete(
 		"/roblox/players",
 		{
+			["server_id"] = self._session.jobID,
 			["id"] = player.UserId,
 			["timestamp"] = when
-		},
-		false
+		}
 	)
-		
-	if not res.success then
-		warn(`[Zyntex]: Could not submit DELETE /roblox/players: "{res.user_message}"`)
-	end
 
 	if self._config.debug then
 		print("[Zyntex]: Player leave submitted.")
 	end
-	
+
 	for _,activity in SERVER_ACTIVITY do
 		if activity.player_id == player.UserId and activity.left_at == nil then
 			activity["left_at"] = when
-			activity["visit_id"] = res.data
 		end
 	end
 end
@@ -810,14 +795,15 @@ function Zyntex.Moderate(self: Zyntex, player: Player | number, type: string, re
 	if test == nil then
 		test = RunService:IsStudio()
 	end
-	
+
 	if type == "ban" then
 		playerObject:Kick(reason)
 	end
-	
+
 	local res = self._session:post(
 		`/roblox/players/{playerId}/moderate`,
 		{
+			["server_id"] = self._session.jobID,
 			["type"] = type,
 			["reason"] = reason,
 			["expires_at"] = expiresAt,
@@ -825,13 +811,11 @@ function Zyntex.Moderate(self: Zyntex, player: Player | number, type: string, re
 		}
 	)
 
-	assert(res.success, `Failure when attempting to create moderation: {res.user_message}`)
-
 	if self._config.debug then
 		print(`[Zyntex]: Moderation created successfully.`)
 	end
 
-	return res.success
+	return true
 end
 
 --[[
@@ -892,6 +876,32 @@ function Zyntex.Kick(self: Zyntex, player: Player | number, reason: string, test
 	return self:Moderate(player, "kick", reason, nil, test)
 end
 
+
+
+--[[
+	@method Zyntex:CleanupPendingJoins
+	@description Manually clean up pending joins that may have been stuck.
+	This is useful for debugging or in case of network issues.
+	@param self Zyntex
+	@return number -- Returns the number of pending joins that were cleaned up.
+]]
+-- Note: CleanupPendingJoins removed - joins are cleaned up immediately on result
+
+--[[
+	@method Zyntex:GetPendingJoinsCount
+	@description Get the current count of pending joins.
+	This is useful for monitoring the state of join operations.
+	@param self Zyntex
+	@return number -- Returns the number of pending joins.
+]]
+function Zyntex.GetPendingJoinsCount(self: Zyntex)
+	local count = 0
+	for _ in pairs(self._pendingJoins) do
+		count = count + 1
+	end
+	return count
+end
+
 --[[
 	@method Zyntex:poll
 	@description Initiates the long-polling loop to listen for real-time actions and invocations
@@ -902,44 +912,96 @@ end
 ]]
 function Zyntex.poll(self: Zyntex, since: string)
 	return function()
-		-- The wait time between polls, increases dynamically when no events are received.
-		local nextWaitTime = 2;
+		local nextWaitTime = Random.new():NextInteger(4, 7)
 		while true do
 			if self._config.debug then
-				print("[Zyntex]: Polling for updates...")
+				print("[Zyntex]: Flushing /push buffer (poll)...")
 			end
 
-			local res
-
-			local success,data = pcall(function()
-				res = self._session:get(`/roblox/listen?since={since}`)
-
-				if not res.success then
-					error(`[Zyntex]: Failure to poll for updates: {res.user_message}`)
-				end
+			local items = {}
+			local ok, resp = pcall(function()
+				return self._session:Flush(since)
 			end)
-
-			if not success then
-				warn(data)
-				task.wait(nextWaitTime + 10) -- Longer wait on error
-				continue
+			if ok and resp and resp.success then
+				items = (resp.data and resp.data.listen_data) or {}
+				if #items == 0 then
+					nextWaitTime = math.clamp(nextWaitTime + 0.1, 2, 10)
+				else
+					nextWaitTime = 2
+					since = now()
+				end
+			else
+				nextWaitTime = nextWaitTime + 10
 			end
 
-			-- If the response was empty, slightly increase the wait time for the next poll.
-			if #res.data == 0 then
-				nextWaitTime = math.clamp(nextWaitTime + .1, 2, 5)
+			-- Dispatch any received events
+			for _, entry in pairs(items) do
+				local bucket = self._listeners[entry.type]
+				if bucket then
+					for _, listener in pairs(bucket) do
+						listener(entry.data)
+					end
+				end
 			end
 
-			-- If we received data, reset the poll timer and update the 'since' timestamp.
-			if #res.data > 0 then
-				nextWaitTime = 2
-				since = now()
-			end
+			-- React to per-item results: moderate on failed joins (401/403)
+			if resp and resp.data and resp.data.results then
+				for _, result in pairs(resp.data.results) do
+					-- We only care about failed player joins here
+					if result.method == "POST /roblox/players" and result.rid then
+						local rid = result.rid
+						local player = self._pendingJoins[rid]
+						if player then
+							if result.success == true then
+								-- successfully admitted; clear pending
+								self._pendingJoins[rid] = nil
+								if self._config.debug then
+									print(`[Zyntex]: Join confirmed for {player.Name} (RID: {rid})`)
+								end
+							else
+								-- Parse "CODE: reason" -> e.g. "403: racism" / "401: spam"
+								local codeStr, reason = nil, nil
+								if typeof(result.error) == "string" then
+									codeStr, reason = string.match(result.error, "^(%d+)%s*:%s*(.+)$")
+								end
+								local code = tonumber(codeStr or "")
+								reason = reason or "Moderation"
 
-			-- Dispatch received events to their corresponding listeners.
-			for i,event in pairs(res.data) do
-				for _,listener in pairs(self._listeners[event.type]) do
-					listener(event.data)
+								if code == 403 then
+									-- BAN: kick immediately + fire ban listeners
+									local p = Players:GetPlayerByUserId(player.UserId)
+									if p then p:Kick(reason) end
+									if self._listeners["ban"] then
+										for _,cb in self._listeners["ban"] do
+											cb(player.UserId, reason)
+										end
+									end
+									if self._config.debug then
+										warn(`[Zyntex]: {player.Name} blocked (BAN) — {reason}`)
+									end
+								elseif code == 401 then
+									-- MUTE: silence chat + fire mute listeners
+									muteUserId(player.UserId)
+									if self._listeners["mute"] then
+										for _,cb in self._listeners["mute"] do
+											cb(player.UserId, reason)
+										end
+									end
+									if self._config.debug then
+										warn(`[Zyntex]: {player.Name} auto-muted — {reason}`)
+									end
+								else
+									-- Unknown failure; just warn
+									warn(`[Zyntex]: Join failed for {player.Name} (RID: {rid}) — {tostring(result.error)}`)
+								end
+
+								-- In all error cases, clear pending
+								self._pendingJoins[rid] = nil
+							end
+						elseif self._config.debug then
+							print(`[Zyntex]: Result for unknown RID (possibly already cleaned): {result.rid}`)
+						end
+					end
 				end
 			end
 
@@ -978,6 +1040,7 @@ function Zyntex.logServiceMessage(self: Zyntex, msg: string, type: Enum.MessageT
 		self._session:post(
 			"/roblox/logservice",
 			{
+				["server_id"] = self._session.jobID,
 				["message"] = msg,
 				["type"] = convertedType
 			}
@@ -1019,13 +1082,13 @@ function Zyntex.Log(self: Zyntex, message: string, player: Player? | number?)
 		payload
 	)
 
-	assert(res.success, `Failure when attempting to post log: {res.user_message}`)
+	-- Under /push this is enqueued; no synchronous assert.
 
 	if self._config.debug then
 		print(`[Zyntex]: Log posted succesfully.`)
 	end
 
-	return res.success
+	return true
 end
 
 --[[
@@ -1043,14 +1106,13 @@ function Zyntex.ProcessPurchase(self: Zyntex, player: Player | number, price: nu
 	local res = self._session:post(
 		`/roblox/players/{if type(player) == "number" then player else player.UserId}/robux-spent`,
 		{
+			["server_id"] = self._session.jobID,
 			["robux_spent"] = price;
 			["metadata"]    = productName
 		}
 	)
 
-	assert(res.success, `Failed when attempting to process purchase: {res.user_message}`)
-
-	return res.success
+	return true
 end
 
 --[[
@@ -1064,20 +1126,53 @@ end
 function Zyntex.new(gameToken: string): Zyntex
 	local self = {}
 
+	-- Pass JobId to enable the API push buffer/flush worker
 	self._session   = API.new(gameToken)
 	self._config    = {}
 	self._events    = {}
 	self._functions = {}
 	self._listeners = {}
+	self._pendingJoins = {}
 	self._version   = CLIENT_VERSION
 
-	local current_version = self._session:get("/roblox/latest-client-version")
-
-	assert(current_version.success, `Zyntex API is currently down.`)
-
+	local current_version = self._session:get("/roblox/latest-client-version") -- direct HTTP (not push)
+	assert(current_version and current_version.success, `Zyntex API is currently down.`)
 	if (current_version.data ~= CLIENT_VERSION) then
 		warn(`[Zyntex]: Your client is outdated, please download the latest version. current: v{CLIENT_VERSION}; latest: v{current_version.data}`)
 	end
+	
+	-- Inside Zyntex.init, right after `self._session` is created
+	local function handlePush(data)
+		-- reuse the same logic currently inside Zyntex.poll
+		if data and data.results then
+			for _, result in ipairs(data.results) do
+				if result.method == "POST /roblox/players" and result.rid then
+					local player = self._pendingJoins[result.rid]
+					if not player then continue end
+
+					if not result.success and typeof(result.error) == "string" then
+						local codeStr, reason = string.match(
+							result.error,
+							"^(%d+)%s*:%s*(.+)$"
+						)
+						local code = tonumber(codeStr)
+						reason = reason or "Moderation"
+
+						if code == 403 then
+							local p = Players:GetPlayerByUserId(player.UserId)
+							if p then p:Kick(reason) end
+						elseif code == 401 then
+							muteUserId(player.UserId)
+						end
+					end
+					self._pendingJoins[result.rid] = nil
+				end
+			end
+		end
+	end
+
+	-- register the universal handler
+	self._session:onFlush(handlePush)
 
 	return setmetatable(self, Zyntex)
 end
@@ -1137,7 +1232,7 @@ function Zyntex.GetPlayerInfo(self: Zyntex, player: Player | number): {player: Z
 
 	local playerInfo = res.data
 	local playerInfoRaw = res.data.player
-	
+
 	playerInfo["player"] = ZyntexPlayer.new(
 		playerInfoRaw.id,
 		playerInfoRaw.name,
@@ -1146,7 +1241,7 @@ function Zyntex.GetPlayerInfo(self: Zyntex, player: Player | number): {player: Z
 		playerInfoRaw.reputation,
 		playerInfoRaw.raw_reputation
 	)
-	
+
 	return playerInfo
 end
 
@@ -1214,16 +1309,51 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		print("[Zyntex]: Initializing server...")
 	end
 
-	--// Initial server creation
+	--// Initial server creation (ENQUEUED for /roblox/push)
 	local privateServerId = game.PrivateServerId
 	local privateServerParameter = ""
 	if privateServerId ~= "" and game.PrivateServerOwnerId ~= 0 then
-		privateServerParameter = `&isPrivate={privateServerId}`
+		privateServerParameter = privateServerId
 	end
-	local response = self._session:post(`/roblox/servers?version={game.PlaceVersion}{privateServerParameter}`)
+	self._session:post(
+		"/roblox/servers",
+		{
+			["server_id"] = self._session.jobID,
+			["version"] = game.PlaceVersion,
+			["isPrivate"] = privateServerParameter
+		}
+	)
 
-	if response.success == false then
-		error(`Error when attempting to initialize server: {response.user_message}`)
+	-- FIRST FLUSH: create server + fetch manifest + initial listen data + moderation lists
+	local firstPush = self._session:Flush(since)
+	if not firstPush or not firstPush.success then
+		error(`Error when attempting to initialize server via /push`)
+	end
+	local manifest = firstPush.data and firstPush.data.manifest
+	local listen_data = firstPush.data and firstPush.data.listen_data
+
+	-- Materialize functions + events from manifest (from /push)
+	if manifest then
+		for _,v in pairs(manifest) do
+			if v.type == "function" then
+				table.insert(self._functions, Function.new(
+					self,
+					v.id,
+					v.name,
+					v.description or "",
+					v.parameters or {}
+					))
+			elseif v.type == "event" then
+				table.insert(self._events, Event.new(
+					self,
+					v.id,
+					v.name,
+					v.description or "",
+					v.data or {},
+					false
+					))
+			end
+		end
 	end
 
 	--// Capture and send historical logs from before the client initialized.
@@ -1259,46 +1389,25 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			print("[Zyntex]: Server closing...")
 		end
 		sendingStatus = true
-		self._session:delete("/roblox/servers")
+		self._session:delete("/roblox/servers", { ["server_id"] = self._session.jobID })
+		self._session:Flush()
+
+		-- Clean up pending joins on shutdown
+		local pendingCount = 0
+		for rid, _ in pairs(self._pendingJoins) do
+			pendingCount = pendingCount + 1
+		end
+		if pendingCount > 0 and config.debug then
+			print(("[Zyntex]: Cleaning up %d pending joins on shutdown"):format(pendingCount))
+		end
+		self._pendingJoins = {}
 	end)
 
 	--// Start the background processes.
 	task.spawn(statusUpdateLoop, self)
-	task.spawn(self:poll(since))
+	task.spawn(self:poll(since)) -- poll now uses /roblox/push flush
 
-	if config.debug then
-		print("[Zyntex]: Fetching events...")
-	end
-
-	--// Fetch event + function manifest
-	local res = self._session:get("/roblox/manifest")
-
-	if not res.success then
-		warn(`[Zyntex]: Could not fetch manifest: {res.user_message}`)
-	end
-
-	for i,v in pairs(res.data) do
-		if v.type == "function" then
-			table.insert(self._functions, Function.new(
-				self,
-				v.id,
-				v.name,
-				v.description,
-				v.parameters
-				)
-			)
-			continue
-		end
-		table.insert(self._events, Event.new(
-			self,
-			v.id,
-			v.name,
-			v.description,
-			v.data,
-			false
-			)
-		)
-	end
+	-- (No direct /manifest fetch: handled via first /push response)
 
 	--// Handle server shutdown action from the dashboard.
 	self._listeners["shutdown"] = {}
@@ -1316,7 +1425,9 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 
 		-- Notify the dashboard that the action has been fulfilled.
 		local res = self._session:post(
-			`/roblox/actions/{action.id}/fulfill`
+			`/roblox/actions/{action.id}/fulfill`,
+			{},
+			true
 		)
 
 		if not res.success then
@@ -1350,12 +1461,10 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		end)
 
 		local res = self._session:post(
-			`/roblox/actions/{action.id}/fulfill`
+			`/roblox/actions/{action.id}/fulfill`,
+			{},
+			true
 		)
-
-		if not res.success then
-			warn(`[Zyntex]: RCE fulfillment failed: {res.user_message}`)
-		end
 
 		if config.debug then
 			print(`[Zyntex]: RCE fulfilled.`)
@@ -1373,7 +1482,9 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 		game:GetService("ReplicatedStorage"):FindFirstChild("zyntex.events"):FindFirstChild("SystemChat"):FireAllClients(action.metadata)
 
 		local res = self._session:post(
-			`/roblox/actions/{action.id}/fulfill`
+			`/roblox/actions/{action.id}/fulfill`,
+			{},
+			true
 		)
 
 		if not res.success then
@@ -1384,7 +1495,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			print(`[Zyntex]: Chat fulfilled.`)
 		end
 	end)
-	
+
 	--// Handle moderation action from the dashboard.
 	self._listeners["moderation"] = {}
 	self._listeners["ban"]  = {}
@@ -1396,14 +1507,14 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			print(`[Zyntex]: Fulfilling moderation request...`)
 			print(`[Zyntex]: {action}`)
 		end
-		
+
 		local fullfilled = false
-		
+
 		local type = action.metadata.type
 		local player_id = action.metadata.player_id
 		local reason = action.metadata.reason
-		
-		
+
+
 		if #self._listeners[type] == 0 then
 			if type == "ban" or type == "kick" then
 				local player = Players:GetPlayerByUserId(player_id)
@@ -1412,7 +1523,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 					fullfilled = true
 				end
 			end
-			
+
 			if type == "mute" then
 				local player = Players:GetPlayerByUserId(player_id)
 				if player then
@@ -1426,10 +1537,12 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			end
 			fullfilled = true
 		end
-		
+
 		if fullfilled then
 			local res = self._session:post(
-				`/roblox/actions/{action.id}/fulfill`
+				`/roblox/actions/{action.id}/fulfill`,
+				{},
+				true
 			)
 
 			if not res.success then
@@ -1448,7 +1561,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 			simulateActivity(self)
 		end)
 	end
-	
+
 	--// Connect player join/leave listeners.
 	Players.PlayerAdded:Connect(function(player: Player)
 		return onPlayerAdd(self, player)
@@ -1458,7 +1571,7 @@ function Zyntex.init(self: Zyntex, config: TYPES.Config)
 	for i,player in Players:GetPlayers() do
 		onPlayerAdd(self, player)
 	end
-	
+
 	Players.PlayerRemoving:Connect(function(player: Player)
 		return onPlayerRemove(self, player)
 	end)
@@ -1503,7 +1616,16 @@ function Zyntex.Telemetry(self: Zyntex, flushEvery: number?, registryName: strin
 end
 
 --[[
-	The Zyntex module is returned to be required and used by other server scripts.
+	@method Zyntex:Experiments
+	@description Constructs a new Experiments object used for A/B testing.
+	@param experimentId string -- The ID of the experiment, i.e. "new_shop_ui". Set when creating experiment.
+	@return Experiment? -- The Experiment, if exists and is not Archived
 ]]
+function Zyntex.GetExperiment(self: Zyntex, experimentId: string): Experiments.Experiment?
+	return Experiments.new(
+		self._session,
+		experimentId
+	)
+end
 
 return Zyntex
